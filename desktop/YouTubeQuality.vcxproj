@@ -40,6 +40,7 @@
     <ClCompile Include="Main.cpp" />
     <ClCompile Include="QualityMenu.cpp" />
     <ClCompile Include="Tray.cpp" />
+    <ClInclude Include="QualityFormat.h" />
     <ClInclude Include="QualityMenu.h" />
     <ClInclude Include="Tray.h" />
     <ResourceCompile Include="YouTubeQuality.rc" />

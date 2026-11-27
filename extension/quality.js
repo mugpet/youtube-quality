@@ -7,9 +7,10 @@
   const startupDelays = [200, 500, 1000, 2500, 5000];
   const switchDelays = [2500, 5000, 10000];
   const offerDelays = [1200, 3500, 8000];
+  const settleDelay = 4000;
 
   let player = null;
-  let lastRequest = null;
+  let selection = null;
   let timer = null;
   let dueAt = 0;
   let startupAttempt = 0;
@@ -24,22 +25,25 @@
     }
     let best = null;
     const formats = new Map();
+    const levels = new Set();
     for (const row of rows) {
       if (!row?.quality || row.quality === 'auto' || row.isPlayable === false) continue;
       const label = row.qualityLabel ?? '';
       const match = /(\d{2,5})\s*p(\d{2,3})?/i.exec(label);
       const height = match ? Number(match[1]) : heights[row.quality];
-      if (!(height > 0 && height <= maxHeight)) continue;
+      if (!(height > 0)) continue;
+      levels.add(row.quality);
       const premium = Boolean(row.paygatedQualityDetails || /premium|enhanced bitrate/i.test(label));
       const fps = Number(match?.[2] ?? 0);
       const offer = { quality: row.quality, formatId: row.formatId, height, premium, fps };
       if (offer.formatId != null) formats.set(String(offer.formatId), offer);
+      if (height > maxHeight) continue;
       if (!best || height > best.height || (height === best.height &&
           (premium > best.premium || (premium === best.premium && fps > best.fps)))) {
         best = offer;
       }
     }
-    return best && { ...best, formats };
+    return best && { ...best, formats, levels };
   }
 
   function schedule(delay) {
@@ -86,36 +90,42 @@
       next?.addEventListener(name, wake);
     }
     player = next;
-    lastRequest = null;
+    selection = null;
     resetOfferChecks(null);
   }
 
-  function alreadySelected(target) {
-    const preferred = player.getPreferredQuality?.();
-    const pinned = preferred === target.quality;
-    // Auto can currently be decoding the target resolution without a manual pin.
-    if (preferred && preferred !== 'unknown' && !pinned) return false;
-    const checkFormat = target.formatId != null && (target.premium || target.fps > 0);
-    if (pinned && !checkFormat) return true;
-
-    const actual = player.getPlaybackQuality?.();
-    if (actual !== target.quality) {
-      // The preferred setting changes before buffered frames from the old tier finish.
-      if (pinned) return true;
-      // A legacy player with neither readback can only be requested once per target.
-      return Boolean(lastRequest && (!actual || actual === 'unknown'));
-    }
-    if (checkFormat) {
-      const fmt = player.getVideoStats?.()?.fmt;
-      if (fmt != null && String(fmt) !== String(target.formatId)) {
-        // Several codecs can represent the same resolution, frame rate and Premium choice.
-        const current = target.formats.get(String(fmt));
-        if (current?.quality === target.quality)
-          return current.premium === target.premium && current.fps === target.fps;
-        return !target.premium;
+  function needsCorrection(target) {
+    // A player can retain the previous stream's tier before the new video has frames.
+    const video = player.querySelector('video');
+    const hasFrames = video?.readyState >= 2;
+    let actual = hasFrames ? player.getPlaybackQuality?.() : null;
+    if (!Object.hasOwn(heights, actual) && !target.levels.has(actual)) {
+      actual = null;
+      if (hasFrames) {
+        const current = target.formats.get(String(player.getVideoStats?.()?.fmt));
+        const height = Math.min(video.videoWidth, video.videoHeight);
+        // Cropped video can have nonstandard dimensions. Only infer an exact match.
+        actual = current?.quality ?? (height === target.height ? target.quality : null);
       }
     }
-    return true;
+
+    if (actual === target.quality) {
+      if (target.formatId != null && (target.premium || target.fps > 0)) {
+        const current = target.formats.get(String(player.getVideoStats?.()?.fmt));
+        // Only a known inferior choice justifies changing a stream at the right resolution.
+        if (current?.quality === target.quality &&
+            (current.premium !== target.premium || current.fps !== target.fps)) return true;
+      }
+      selection.playedBest = true;
+      return false;
+    }
+
+    const preferred = player.getPreferredQuality?.();
+    // A correct pin can take time to replace old buffered frames. A later drop
+    // after this video reached the target gives us a reason to reapply it once.
+    if (preferred === target.quality) return Boolean(actual && selection.playedBest);
+    if (actual || Object.hasOwn(heights, preferred) || target.levels.has(preferred)) return true;
+    return null;
   }
 
   function check() {
@@ -145,24 +155,26 @@
       checkLaterOffers(videoId || pageId, target.height);
       const key = JSON.stringify([videoId || pageId, target.quality, target.formatId]);
       const now = performance.now();
-      if (lastRequest?.key !== key) lastRequest = null;
-      if (alreadySelected(target)) {
-        if (lastRequest) lastRequest.attempts = 0;
+      if (selection?.key !== key) selection = { key, playedBest: false, confirmAt: 0, attempts: 0, nextTry: 0 };
+      const correction = needsCorrection(target);
+      if (!correction) {
+        selection.confirmAt = 0;
+        selection.attempts = 0;
+        if (correction === null) waitForPlayer();
         return;
       }
-      if (lastRequest) {
-        // A switch can buffer for a few seconds. Bound retries if the stream refuses the request.
-        if (now < lastRequest.nextTry) {
-          if (lastRequest.attempts < switchDelays.length) schedule(lastRequest.nextTry - now);
-          return;
-        }
-      } else {
-        lastRequest = { key, attempts: 0, nextTry: 0 };
+      // Give Auto a chance to settle after startup or a brief quality dip.
+      if (!selection.confirmAt) selection.confirmAt = now + settleDelay;
+      if (now < selection.confirmAt) return schedule(selection.confirmAt - now);
+      if (now < selection.nextTry) {
+        if (selection.attempts < switchDelays.length) schedule(selection.nextTry - now);
+        return;
       }
       // Record the attempt before calling the player. It can emit its change event synchronously.
-      const attempt = Math.min(lastRequest.attempts, switchDelays.length - 1);
-      lastRequest.attempts = attempt + 1;
-      lastRequest.nextTry = now + (lastRequest.attempts === switchDelays.length ? 30000 : switchDelays[attempt]);
+      const attempt = Math.min(selection.attempts, switchDelays.length - 1);
+      selection.playedBest = false;
+      selection.attempts = attempt + 1;
+      selection.nextTry = now + (selection.attempts === switchDelays.length ? 30000 : switchDelays[attempt]);
       if (target.formatId != null) {
         player.setPlaybackQualityRange(target.quality, target.quality, target.formatId);
       } else {

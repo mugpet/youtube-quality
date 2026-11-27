@@ -1,4 +1,5 @@
 #include "QualityMenu.h"
+#include "QualityFormat.h"
 
 #include <oleacc.h>
 #include <propkey.h>
@@ -6,12 +7,18 @@
 #include <shobjidl.h>
 #include <wrl/client.h>
 #include <cwctype>
+#include <optional>
 #include <string>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 namespace {
 using Microsoft::WRL::ComPtr;
+using quality::ManualSummaryDisagrees;
+using quality::ParseReportedFormat;
+using quality::PlayingAtBest;
+using quality::ReportedFormat;
 using Element = ComPtr<IUIAutomationElement>;
 using Condition = ComPtr<IUIAutomationCondition>;
 
@@ -296,6 +303,27 @@ bool PremiumBrand(IUIAutomation* uia, IUIAutomationTreeWalker* documents, IUIAut
 struct Option { Element item; int height = 0; bool premium = false; int fps = 0; bool checked = false; };
 struct Choices { Option best; Element selected; bool ambiguous = false; };
 
+std::wstring FormatKey(int height, int fps, bool premium, bool standard) {
+    return std::to_wstring(height) + L"/" + std::to_wstring(fps) +
+           (premium ? L"/premium" : standard ? L"/standard" : L"/unknown");
+}
+
+std::vector<int> DocumentId(IUIAutomationElement* doc) {
+    SAFEARRAY* array = nullptr;
+    if (FAILED(doc->GetRuntimeId(&array)) || !array) return {};
+    std::vector<int> id;
+    LONG low = 0, high = -1;
+    int* values = nullptr;
+    if (SafeArrayGetDim(array) == 1 && SUCCEEDED(SafeArrayGetLBound(array, 1, &low)) &&
+        SUCCEEDED(SafeArrayGetUBound(array, 1, &high)) && high >= low && high - low < 64 &&
+        SUCCEEDED(SafeArrayAccessData(array, reinterpret_cast<void**>(&values)))) {
+        if (values) id.assign(values, values + (high - low + 1));
+        SafeArrayUnaccessData(array);
+    }
+    SafeArrayDestroy(array);
+    return id;
+}
+
 Choices ReadChoices(IUIAutomation* uia, IUIAutomationTreeWalker* documents, IUIAutomationElement* doc,
                     const std::vector<Element>& rows) {
     Choices choices;
@@ -311,13 +339,13 @@ Choices ReadChoices(IUIAutomation* uia, IUIAutomationTreeWalker* documents, IUIA
         }
         if (!Enabled(row.Get())) continue;
         const auto label = Lower(Text(row.Get(), UIA_NamePropertyId));
-        // The visible radio label starts with the resolution. Auto (720p) is
-        // deliberately excluded even when it currently matches our choice.
+        // Auto can describe what is playing, but has no fixed resolution
+        // and cannot serve as a candidate when a change is necessary.
         if (label.empty() || label.front() < L'0' || label.front() > L'9') continue;
         wchar_t* end = nullptr;
         long height = wcstol(label.c_str(), &end, 10);
         if (height < 1 || height > 1440 || *end != L'p') continue;
-        int fps = static_cast<int>(wcstol(end + 1, nullptr, 10));
+        const int fps = ParseReportedFormat(label).fps;
         const auto details = label + L" " + Lower(Text(row.Get(), UIA_HelpTextPropertyId)) +
                              L" " + Lower(Text(row.Get(), UIA_FullDescriptionPropertyId));
         if (Contains(details, L"upgrade") || Contains(details, L"get premium") ||
@@ -337,7 +365,9 @@ Choices ReadChoices(IUIAutomation* uia, IUIAutomationTreeWalker* documents, IUIA
 }
 }  // namespace
 
-MenuResult ApplyBestQuality(IUIAutomation* uia, HWND window) {
+MenuResult ApplyBestQuality(IUIAutomation* uia, HWND window, AutoQualityObservation& previousAuto) {
+    const AutoQualityObservation prior = std::move(previousAuto);
+    previousAuto = {};
     if (!uia || !IsWindow(window)) return MenuResult::NotReady;
     if (GetAncestor(GetForegroundWindow(), GA_ROOT) != window || IsIconic(window)) return MenuResult::Busy;
     ComPtr<IUIAutomationTreeWalker> documents;
@@ -438,6 +468,7 @@ MenuResult ApplyBestQuality(IUIAutomation* uia, HWND window) {
         uia->CreateTreeWalker(menuPanel.Get(), &panels);
     auto run = [&]() -> MenuResult {
         Element quality;
+        std::wstring initialSummary;
         const auto mainDeadline = GetTickCount64() + 1500;
         do {
             if (MenuState(settings.Get()) == OpenState::Open) {
@@ -445,6 +476,7 @@ MenuResult ApplyBestQuality(IUIAutomation* uia, HWND window) {
                     if (!Visible(row.Get())) continue;
                     const auto name = Lower(Text(row.Get(), UIA_NamePropertyId));
                     if (name.rfind(L"quality", 0) == 0 || name.rfind(L"kvalitet", 0) == 0) {
+                        initialSummary = name;
                         quality = row;
                         break;
                     }
@@ -484,6 +516,47 @@ MenuResult ApplyBestQuality(IUIAutomation* uia, HWND window) {
                    (best.premium ? " premium" : " standard") + (best.checked ? " checked" : " unchecked")).c_str());
 #endif
         if (best.checked) return MenuResult::AlreadySet;
+        const ReportedFormat bestFormat{best.height, best.fps, best.premium, !best.premium};
+        const bool autoSelected = Lower(Text(choices.selected.Get(), UIA_NamePropertyId)).rfind(L"auto", 0) == 0;
+        auto assessPlayback = [&]() -> std::optional<MenuResult> {
+            const auto radio = Lower(Text(choices.selected.Get(), UIA_NamePropertyId));
+            const auto liveSummary = Lower(Text(quality.Get(), UIA_NamePropertyId));
+            // Chromium can discard the parent menu item when it opens the
+            // submenu. Its immediately preceding visible label is then our
+            // observation. The checked Auto radio sometimes gives more detail.
+            const auto& summary = liveSummary.empty() ? initialSummary : liveSummary;
+            const auto fromMenu = ParseReportedFormat(summary);
+            const auto fromRadio = ParseReportedFormat(radio);
+            if (!autoSelected) {
+                // A mismatch between the two menus can occur during a switch.
+                if (Contains(summary, L"auto") || ManualSummaryDisagrees(fromMenu, fromRadio)) {
+                    MenuTrace("manual quality changing"); return MenuResult::NotReady;
+                }
+                return std::nullopt;
+            }
+            if (radio.rfind(L"auto", 0) != 0) return MenuResult::NotReady;
+            if (fromMenu.height && !Contains(summary, L"auto")) return MenuResult::NotReady;
+            if ((fromMenu.height && PlayingAtBest(fromMenu, bestFormat)) ||
+                (fromRadio.height && PlayingAtBest(fromRadio, bestFormat))) {
+                MenuTrace("automatic quality already best"); return MenuResult::AlreadySet;
+            }
+            if (fromMenu.height && fromRadio.height && fromMenu.height != fromRadio.height)
+                return MenuResult::NotReady;
+            const auto& current = fromRadio.height ? fromRadio : fromMenu;
+            if (!current.height) { MenuTrace("automatic quality unknown"); return MenuResult::NotReady; }
+            auto id = DocumentId(doc.Get());
+            if (id.empty()) return MenuResult::NotReady;
+            const auto reported = FormatKey(current.height, current.fps, current.premium, current.standard);
+            const auto target = FormatKey(best.height, best.fps, best.premium, !best.premium);
+            const auto now = GetTickCount64();
+            const bool matches = prior.firstSeen && now >= prior.firstSeen && now - prior.firstSeen <= 30000 &&
+                prior.documentId == id && prior.pageUrl == page && prior.reportedQuality == reported &&
+                prior.targetQuality == target;
+            if (matches && now - prior.firstSeen >= autoSettleDelayMs) return std::nullopt;
+            previousAuto = {std::move(id), page, reported, target, matches ? prior.firstSeen : now};
+            MenuTrace("automatic quality settling"); return MenuResult::AutoSettling;
+        };
+        if (const auto decision = assessPlayback()) return *decision;
         if (MenuState(settings.Get()) != OpenState::Open || !samePlayer() || !stillOurs()) return MenuResult::Busy;
         if (!Visible(best.item.Get())) {
             ComPtr<IUIAutomationScrollItemPattern> scrolling;
@@ -499,6 +572,7 @@ MenuResult ApplyBestQuality(IUIAutomation* uia, HWND window) {
         if (SelectedState(choices.selected.Get()) != RadioState::On) {
             MenuTrace("current quality changed"); return MenuResult::NotReady;
         }
+        if (const auto decision = assessPlayback()) return *decision;
         if (!Invoke(best.item.Get())) { MenuTrace("quality select failed"); return MenuResult::NotReady; }
         MenuTrace("quality selected"); return MenuResult::Applied;
     };

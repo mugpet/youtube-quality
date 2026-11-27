@@ -28,6 +28,7 @@ constexpr UINT resultMessage = WM_APP + 2;
 constexpr UINT showMenuMessage = WM_APP + 3;
 constexpr UINT_PTR checkTimer = 1;
 constexpr UINT_PTR trayRetryTimer = 2;
+constexpr UINT initialPlaybackDelay = 3500;
 constexpr UINT checkInterval = 120000;
 
 struct VideoWindow {
@@ -51,6 +52,8 @@ struct Monitor {
     std::vector<LastCheck> recent;
     std::vector<std::wstring> browsers;
     std::thread worker;
+    // The worker owns this observation until FinishCheck joins it.
+    AutoQualityObservation autoQuality;
     UINT_PTR generation = 0;
     ULONGLONG timerDue = 0;
     unsigned retries = 0;
@@ -230,6 +233,7 @@ void Refresh() {
     if (next == monitor.current && !tabChanged) return;
     monitor.current = std::move(next);
     ++monitor.generation;
+    if (!monitor.working) monitor.autoQuality = {};
     monitor.retries = 0;
     monitor.confirmedUnsupported = false;
     StopTimer();
@@ -246,7 +250,7 @@ void Refresh() {
             }
         }
     }
-    CheckIn(850);
+    CheckIn(initialPlaybackDelay);
 }
 
 void BeginCheck() {
@@ -272,7 +276,7 @@ void BeginCheck() {
                 ComPtr<IUIAutomation> automation;
                 if (SUCCEEDED(CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
                                                IID_PPV_ARGS(&automation)))) {
-                    try { result = ApplyBestQuality(automation.Get(), target); }
+                    try { result = ApplyBestQuality(automation.Get(), target, monitor.autoQuality); }
                     catch (const std::exception&) { result = MenuResult::NotReady; }
                 }
             }
@@ -298,14 +302,16 @@ void FinishCheck(UINT_PTR generation, MenuResult result) {
         if (recent.size() == 32) recent.erase(recent.begin());
         recent.push_back({completed, now});
     }
-    if (generation != monitor.generation || !monitor.current.window ||
-        !(CurrentVideo() == monitor.current)) {
+    const bool stillCurrent = generation == monitor.generation && monitor.current.window &&
+                              CurrentVideo() == monitor.current;
+    if (!stillCurrent || result != MenuResult::AutoSettling) monitor.autoQuality = {};
+    if (!stillCurrent) {
         RequestRefresh();
         if (success && monitor.current.window == completed.window && monitor.current.title == completed.title) {
             // Chromium may replace its renderer or briefly focus a menu during our selection.
             // Give the player time to apply the completed request before checking the same video again.
             CheckIn(10000);
-        } else if (monitor.current.window && !monitor.timerDue) CheckIn(850);
+        } else if (monitor.current.window && !monitor.timerDue) CheckIn(initialPlaybackDelay);
         return;
     }
     switch (result) {
@@ -313,6 +319,10 @@ void FinishCheck(UINT_PTR generation, MenuResult result) {
     case MenuResult::AlreadySet:
         monitor.retries = 0;
         CheckIn(checkInterval);
+        break;
+    case MenuResult::AutoSettling:
+        Trace("AutoSettling");
+        CheckIn(autoSettleDelayMs);
         break;
     case MenuResult::Unsupported:
         Trace("Unsupported");

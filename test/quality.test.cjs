@@ -96,7 +96,7 @@ function createPlayer(offers, prepare = () => {}) {
   window.window = window;
   window.self = window;
   window.top = window;
-  prepare({ state, player, later, writes });
+  prepare({ state, player, video, later, writes });
   vm.runInNewContext(script, window, { filename: 'quality.js' });
   function notify(type, target = document) {
     const event = { type, target };
@@ -105,7 +105,7 @@ function createPlayer(offers, prepare = () => {}) {
     if (target !== document) target.emit(type, event);
   }
   flush();
-  return { state, player, video, writes, location, flush, notify, timers,
+  return { state, player, video, writes, location, flush, notify, later, timers,
     get scheduledCount() { return nextTimer; } };
 }
 
@@ -149,7 +149,7 @@ test('leaves an existing 1440p pin alone across checks and a new video', () => {
   assert.equal(fixture.writes.length, 0);
 });
 
-test('pins Auto or a lower preference once even if the target is already decoding', () => {
+test('leaves Auto or a lower preference untouched when the best tier is already decoding', () => {
   for (const preference of ['auto', 'hd720']) {
     const fixture = createPlayer([quality('hd1440', '1440p')], ({ state }) => {
       state.preferred = preference;
@@ -157,9 +157,96 @@ test('pins Auto or a lower preference once even if the target is already decodin
     });
     fixture.notify('playing', fixture.video);
     fixture.flush();
-    assert.equal(fixture.state.preferred, 'hd1440');
-    assert.equal(fixture.writes.length, 1);
+    assert.equal(fixture.state.preferred, preference);
+    assert.equal(fixture.writes.length, 0);
   }
+});
+
+test('lets Auto reach the target during startup without writing', () => {
+  const fixture = createPlayer([quality('hd1440', '1440p')], ({ state, later }) => {
+    later(() => { state.actual = 'hd1440'; }, 2000);
+  });
+  assert.equal(fixture.state.preferred, 'auto');
+  assert.equal(fixture.writes.length, 0);
+  assert.equal(fixture.timers.size, 0);
+});
+
+test('never writes during a long reload with Auto and no readable frames', () => {
+  for (const startupTier of ['unknown', 'medium']) {
+    const fixture = createPlayer([quality('hd1440', '1440p')], ({ state, video, later, writes }) => {
+      Object.assign(state, { actual: startupTier, preferred: 'auto', format: undefined });
+      Object.assign(video, { readyState: 0, videoWidth: 0, videoHeight: 0 });
+      later(() => {
+        assert.equal(writes.length, 0);
+        state.actual = 'hd1440';
+        Object.assign(video, { readyState: 4, videoWidth: 2560, videoHeight: 1440 });
+      }, 8000);
+    });
+    assert.equal(fixture.writes.length, 0);
+    assert.equal(fixture.state.preferred, 'auto');
+    assert.equal(fixture.timers.size, 0);
+  }
+});
+
+test('corrects a confirmed lower pin when decoded quality is unknown', () => {
+  const fixture = createPlayer([quality('hd1440', '1440p')], ({ state, video }) => {
+    Object.assign(state, { actual: 'unknown', preferred: 'hd720', format: undefined });
+    video.readyState = 0;
+  });
+  assert.equal(fixture.writes.length, 1);
+  assert.equal(fixture.state.preferred, 'hd1440');
+});
+
+test('uses a known live format for cropped video without guessing its tier from dimensions', () => {
+  for (const [format, expectedWrites] of [[137, 1], [999, 0]]) {
+    const fixture = createPlayer([quality('hd1440', '1440p', { formatId: 271 }), regular],
+      ({ state, video }) => {
+        Object.assign(state, { actual: 'unknown', preferred: 'auto', format });
+        Object.assign(video, { readyState: 4, videoWidth: 1920, videoHeight: 822 });
+      });
+    assert.equal(fixture.writes.length, expectedWrites);
+  }
+});
+
+test('rereads Auto after a short mid-video drop and leaves a recovered stream alone', () => {
+  const fixture = createPlayer([quality('hd1440', '1440p')], ({ state }) => {
+    state.actual = 'hd1440';
+  });
+  fixture.state.actual = 'medium';
+  fixture.player.emit('onPlaybackQualityChange', 'medium');
+  fixture.later(() => { fixture.state.actual = 'hd1440'; }, 2000);
+  fixture.flush();
+  assert.equal(fixture.writes.length, 0);
+});
+
+test('corrects a sustained downgrade after Auto or a manual pin was delivering the best tier', () => {
+  for (const preference of ['auto', 'hd1440']) {
+    const fixture = createPlayer([quality('hd1440', '1440p')], ({ state }) => {
+      Object.assign(state, { preferred: preference, actual: 'hd1440' });
+    });
+    fixture.state.actual = 'medium';
+    fixture.player.emit('onPlaybackQualityChange', 'medium');
+    fixture.later(() => assert.equal(fixture.writes.length, 0), 3000);
+    fixture.flush();
+    assert.equal(fixture.writes.length, 1);
+    assert.equal(fixture.state.actual, 'hd1440');
+  }
+});
+
+test('still caps an above-1440p stream that Auto keeps selecting', () => {
+  const fixture = createPlayer([quality('hd2160', '2160p'), quality('hd1440', '1440p')], ({ state }) => {
+    state.actual = 'hd2160';
+  });
+  assert.equal(fixture.writes.length, 1);
+  assert.equal(fixture.state.actual, 'hd1440');
+});
+
+test('recognizes optimal video dimensions when the player cannot report the current tier', () => {
+  const fixture = createPlayer([quality('hd1440', '1440p')], ({ player, video }) => {
+    delete player.getPlaybackQuality;
+    Object.assign(video, { videoWidth: 2560, videoHeight: 1440 });
+  });
+  assert.equal(fixture.writes.length, 0);
 });
 
 test('keeps one request while the player is still decoding a lower resolution', () => {
@@ -183,6 +270,10 @@ test('distinguishes a correct Premium pin from regular 1080p after buffering end
   fixture.state.actual = 'medium';
   fixture.state.format = 18;
   fixture.notify('resize', fixture.video);
+  fixture.later(() => {
+    fixture.state.actual = 'hd1080';
+    fixture.state.format = premium.formatId;
+  }, 2000);
   fixture.flush();
   assert.equal(fixture.writes.length, 0);
   fixture.state.actual = 'hd1080';
@@ -190,6 +281,13 @@ test('distinguishes a correct Premium pin from regular 1080p after buffering end
   fixture.player.emit('onPlaybackQualityChange', 'hd1080');
   fixture.flush();
   assert.deepEqual(fixture.writes, [{ low: 'hd1080', high: 'hd1080', format: premium.formatId }]);
+});
+
+test('leaves an unidentifiable 1080p format alone even when Premium is available', () => {
+  const fixture = createPlayer([regular, premium], ({ state }) => {
+    Object.assign(state, { preferred: 'auto', actual: 'hd1080', format: 999 });
+  });
+  assert.equal(fixture.writes.length, 0);
 });
 
 test('leaves an equivalent advertised Premium format alone', () => {
@@ -220,19 +318,19 @@ test('uses observed playback when a legacy player cannot report the pin', () => 
   assert.equal(fixture.writes.length, 1);
 });
 
-test('requests once per video if the player exposes no quality readback at all', () => {
+test('leaves the player alone on every video if it exposes no usable quality evidence', () => {
   const fixture = createPlayer([quality('hd1440', '1440p')], ({ player }) => {
     delete player.getPreferredQuality;
     delete player.getPlaybackQuality;
   });
   fixture.notify('loadedmetadata', fixture.video);
   fixture.flush();
-  assert.equal(fixture.writes.length, 1);
+  assert.equal(fixture.writes.length, 0);
   fixture.location.search = '?v=second';
   fixture.state.videoId = 'second';
   fixture.notify('yt-navigate-finish');
   fixture.flush();
-  assert.equal(fixture.writes.length, 2);
+  assert.equal(fixture.writes.length, 0);
 });
 
 test('uses legacy level tokens when detailed offers are unavailable', () => {
